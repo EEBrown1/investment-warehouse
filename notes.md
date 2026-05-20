@@ -43,6 +43,13 @@ What I've Done
     - unrealized_gains
     - portfolio_allocation
 
+14. current_holdings view updated to include account and broker data
+
+15. added views
+    - daily_holdings
+    - daily_security_value
+    - daily_portfolio_security_value
+    - monthly_portfolio_security_value
 
 ==================
 Table Descriptions
