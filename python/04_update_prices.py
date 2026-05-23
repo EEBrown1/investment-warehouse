@@ -7,12 +7,16 @@ from pathlib import Path
 CACHE_DIR = Path("data/cache/yfinance").resolve()
 yf.set_tz_cache_location(str(CACHE_DIR))
 
-START_DATE = "2025-01-01"
+START_DATE = "2021-01-01"
+UPDATE_CLOSED_POSITIONS = False
 
 
 def get_yahoo_symbol(ticker: str, currency: str) -> str:
     ticker = str(ticker).upper().strip()
     currency = str(currency).upper().strip()
+
+    if ticker.endswith(".TO"):
+        return ticker
 
     if currency == "CAD":
         return f"{ticker}.TO"
@@ -20,29 +24,107 @@ def get_yahoo_symbol(ticker: str, currency: str) -> str:
     return ticker
 
 
+def get_price_currency(ticker: str, currency: str) -> str:
+    currency = str(currency).upper().strip()
+    return currency
+
+
 def get_securities() -> pd.DataFrame:
-    query = """
+    if not UPDATE_CLOSED_POSITIONS:
+        holdings_query = """
+            SELECT
+                DISTINCT h.ticker,
+                h.currency,
+                msm.yahoo_symbol,
+                COALESCE(msm.price_currency, h.currency) AS price_currency
+            FROM current_holdings_from_events h
+            LEFT JOIN manual_security_mappings msm
+                ON h.ticker = msm.source_ticker
+                AND h.currency = msm.source_currency
+            WHERE h.shares_owned > 0
+            ORDER BY h.ticker;
+        """
+
+        holdings = pd.read_sql(holdings_query, engine)
+
+        if not holdings.empty:
+            print("Updating prices for currently held securities only.")
+            return holdings
+
+        print("No current holdings found; falling back to securities table.")
+
+    securities_query = """
         SELECT DISTINCT
-            ticker,
-            currency
-        FROM securities
-        WHERE ticker IS NOT NULL
-          AND currency IS NOT NULL
-        ORDER BY ticker;
+            s.ticker,
+            s.currency,
+            msm.yahoo_symbol,
+            COALESCE(msm.price_currency, s.currency) AS price_currency
+        FROM securities s
+        LEFT JOIN manual_security_mappings msm
+            ON s.ticker = msm.source_ticker
+            AND s.currency = msm.source_currency
+        WHERE s.ticker IS NOT NULL
+          AND s.currency IS NOT NULL
+        ORDER BY s.ticker;
     """
 
-    return pd.read_sql(query, engine)
+    securities = pd.read_sql(securities_query, engine)
+
+    if not securities.empty:
+        return securities
+
+    print("No securities found in securities table; falling back to transactions.")
+
+    transactions_query = """
+        SELECT DISTINCT
+            t.ticker,
+            t.currency,
+            msm.yahoo_symbol,
+            COALESCE(msm.price_currency, t.currency) AS price_currency
+        FROM transactions t
+        LEFT JOIN manual_security_mappings msm
+            ON t.ticker = msm.source_ticker
+            AND t.currency = msm.source_currency
+        WHERE t.ticker IS NOT NULL
+          AND t.currency IS NOT NULL
+        ORDER BY t.ticker;
+    """
+
+    return pd.read_sql(transactions_query, engine)
 
 
 def download_prices(securities: pd.DataFrame) -> pd.DataFrame:
     all_prices = []
 
+    securities = securities.copy()
+    if "yahoo_symbol" not in securities.columns:
+        securities["yahoo_symbol"] = None
+
+    if "price_currency" not in securities.columns:
+        securities["price_currency"] = None
+
+    securities["yahoo_symbol"] = securities.apply(
+        lambda row: row["yahoo_symbol"]
+        if pd.notna(row["yahoo_symbol"])
+        else get_yahoo_symbol(row["ticker"], row["currency"]),
+        axis=1
+    )
+    securities["price_currency"] = securities.apply(
+        lambda row: row["price_currency"]
+        if pd.notna(row["price_currency"])
+        else get_price_currency(row["ticker"], row["currency"]),
+        axis=1
+    )
+    securities = securities.drop_duplicates(
+        subset=["ticker", "yahoo_symbol", "price_currency"]
+    )
+
     for _, row in securities.iterrows():
         ticker = row["ticker"]
-        currency = row["currency"]
-        yahoo_symbol = get_yahoo_symbol(ticker, currency)
+        yahoo_symbol = row["yahoo_symbol"]
+        price_currency = row["price_currency"]
 
-        print(f"Downloading {ticker} as {yahoo_symbol}")
+        print(f"Downloading {ticker} as {yahoo_symbol} ({price_currency})")
 
         data = yf.download(
             yahoo_symbol,
@@ -63,7 +145,7 @@ def download_prices(securities: pd.DataFrame) -> pd.DataFrame:
         prices = prices[["Date", "Close"]].copy()
 
         prices["ticker"] = ticker
-        prices["currency"] = currency
+        prices["currency"] = price_currency
 
         prices = prices.rename(columns={
             "Date": "price_date",
@@ -125,10 +207,9 @@ def load_prices(prices: pd.DataFrame) -> None:
                 close_price,
                 currency
             FROM staging_daily_prices
-            ON CONFLICT (ticker, price_date)
+            ON CONFLICT (ticker, currency, price_date)
             DO UPDATE SET
-                close_price = EXCLUDED.close_price,
-                currency = EXCLUDED.currency;
+                close_price = EXCLUDED.close_price;
         """))
 
     print(f"Upserted {len(prices)} price rows into daily_prices.")
